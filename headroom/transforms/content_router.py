@@ -917,9 +917,15 @@ def _protected_json_spans(content: str) -> list[tuple[int, int]]:
     160-object search payload (see
     ``test_force_kompress_routes_anthropic_tool_result_to_targeted_kompress``).
     """
-    from .recursive_json import carries_record_array, json_document_spans
+    from .recursive_json import carries_record_array, scan_json_documents
 
-    spans = json_document_spans(content)
+    spans, complete = scan_json_documents(content)
+    if not complete:
+        # The scan stopped at its budget (input built to defeat the linear walk),
+        # so a record array past that point cannot be ruled out. Protect the
+        # whole block: declining a prose compression is recoverable, a silently
+        # deleted record is not.
+        return [(0, len(content))]
     if not spans:
         return []
     if (

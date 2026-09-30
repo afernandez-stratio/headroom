@@ -884,6 +884,79 @@ def test_record_array_is_protected_even_beside_a_lone_object(
     assert kompress_inputs == []
 
 
+def test_protection_scan_stays_linear_on_brace_heavy_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Source and logs are full of ``{`` that never close. The protection guard
+    scans at every Kompress boundary; it must not re-read the rest of the block
+    for each brace, or large tool output spends its compression time in scans."""
+    import headroom.transforms.recursive_json as rj
+
+    router = ContentRouter(ContentRouterConfig())
+    line = "    if (flags & MASK) { log.debug(state); retry(ctx, {timeout: 30, max attempts\n"
+    block = line * 800  # ~65 KB, two unmatched `{` per line, no JSON at all
+    walked = 0
+    real = rj._scan_from
+
+    def counting(text, start, known):  # noqa: ANN001, ANN202
+        nonlocal walked
+        end, n = real(text, start, known)
+        walked += n
+        return end, n
+
+    monkeypatch.setattr(rj, "_scan_from", counting)
+    kompress_inputs: list[str] = []
+
+    class HalvingKompress:
+        def is_ready(self) -> bool:
+            return True
+
+        def compress(self, content: str, **_kwargs: object) -> SimpleNamespace:
+            kompress_inputs.append(content)
+            out = " ".join(content.split()[::2])
+            return SimpleNamespace(compressed=out, compressed_tokens=len(out.split()))
+
+    monkeypatch.setattr(router, "_get_kompress", lambda: HalvingKompress())
+
+    out, _tokens = router._try_ml_compressor(block, context="")
+
+    # No JSON to protect, so prose compression still runs...
+    assert kompress_inputs
+    assert out != block
+    # ...and every scan of the call together stays a small multiple of one pass
+    # (the quadratic walk read hundreds of times the block here).
+    assert walked <= 8 * len(block), (walked, len(block))
+
+
+def test_unfinished_protection_scan_protects_the_whole_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the scan ever stops at its budget, a record array past that point
+    cannot be ruled out, so the block is kept away from the prose model."""
+    import headroom.transforms.recursive_json as rj
+
+    monkeypatch.setattr(rj, "_SCAN_BUDGET_PER_CHAR", 0)
+    monkeypatch.setattr(rj, "_SCAN_BUDGET_FLOOR", 0)
+    router = ContentRouter(ContentRouterConfig())
+    block = "Results below. " + json.dumps([{"id": i, "v": "x" * 20} for i in range(5)])
+    kompress_inputs: list[str] = []
+
+    class RecordEatingKompress:
+        def is_ready(self) -> bool:
+            return True
+
+        def compress(self, content: str, **_kwargs: object) -> SimpleNamespace:
+            kompress_inputs.append(content)
+            return SimpleNamespace(compressed="eaten", compressed_tokens=1)
+
+    monkeypatch.setattr(router, "_get_kompress", lambda: RecordEatingKompress())
+
+    out, _tokens = router._try_ml_compressor(block, context="")
+
+    assert out == block
+    assert kompress_inputs == []
+
+
 def test_relevance_split_still_runs_for_line_contained_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
